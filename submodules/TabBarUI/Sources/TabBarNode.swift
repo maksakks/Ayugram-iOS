@@ -6,6 +6,7 @@ import Display
 import UIKitRuntimeUtils
 import AnimatedStickerNode
 import TelegramAnimatedStickerNode
+import SGSimpleSettings
 
 private extension CGRect {
     var center: CGPoint {

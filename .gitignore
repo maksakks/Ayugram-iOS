@@ -80,3 +80,14 @@ buildServer.json
 Telegram.LSP.json
 **/.build/**
 spm-files
+
+# Local signing material: certificates, private keys and provisioning profiles
+# must never be committed. Profiles are injected by CI from GitHub Secrets.
+build-system/rufatgram-codesigning/certs/*
+build-system/rufatgram-codesigning/profiles/*
+!build-system/rufatgram-codesigning/**/.gitkeep
+build-system/rufatgram-codesigning/*.p12
+build-system/rufatgram-codesigning/*.cer
+build-system/rufatgram-codesigning/*.mobileprovision
+# Real Telegram API credentials are written by CI from secrets, never committed.
+build-system/rufatgram-configuration.local.json

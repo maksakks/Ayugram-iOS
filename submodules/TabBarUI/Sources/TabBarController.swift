@@ -131,8 +131,12 @@ open class TabBarControllerImpl: ViewController, TabBarController {
     private var theme: TabBarControllerTheme
     
     public var cameraItemAndAction: (item: UITabBarItem, action: () -> Void)?
-    
-    public init(navigationBarPresentationData: NavigationBarPresentationData, theme: TabBarControllerTheme) {
+
+    // MARK: Swiftgram
+    private let showTabNames: Bool
+
+    public init(showTabNames: Bool, navigationBarPresentationData: NavigationBarPresentationData, theme: TabBarControllerTheme) {
+        self.showTabNames = showTabNames
         self.navigationBarPresentationData = navigationBarPresentationData
         self.theme = theme
         

@@ -1,0 +1,311 @@
+name: RufatGram iOS build
+
+on:
+  # workflow_dispatch only works once this file is on the default branch;
+  # until then feature branches build unsigned on push.
+  push:
+    branches: [ 'feature/**' ]
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: 'Build a signed IPA (requires signing secrets) instead of the unsigned prototype'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    env:
+      CI: '1'
+      # Pinned by versions.json; validated below instead of silently overriding.
+      BAZEL_CACHE_DIR: ${{ github.workspace }}/../bazel-cache
+      # Submodules point at repos with large history; do not clone nested submodules of them.
+      GIT_LFS_SKIP_SMUDGE: '1'
+
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: false
+
+      - name: Read toolchain versions from versions.json
+        id: versions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open("versions.json") as f:
+              v = json.load(f)
+          print(f"xcode={v['xcode']}")
+          print(f"app={v['app']}")
+          print(f"bazel={v['bazel'].split(':')[0]}")
+          print(f"macos={v['macos']}")
+          PY
+          cat "$GITHUB_OUTPUT"
+
+      - name: Select Xcode ${{ steps.versions.outputs.xcode }}
+        run: |
+          set -euo pipefail
+          XCODE_APP="/Applications/Xcode_${{ steps.versions.outputs.xcode }}.app"
+          if [ ! -d "$XCODE_APP" ]; then
+            echo "::error::Xcode ${{ steps.versions.outputs.xcode }} is not installed on this runner."
+            echo "Available Xcode versions:"
+            ls -d /Applications/Xcode*.app || true
+            echo "Update versions.json and the runner image together; do not skip the version check."
+            exit 1
+          fi
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install simulator runtimes for the selected Xcode
+        run: |
+          set -euo pipefail
+          # actool/ibtool need simulator runtimes matching the SDKs of the selected
+          # Xcode (Watch asset catalog, LaunchScreen.xib); runner images only ship
+          # newer runtimes.
+          xcrun simctl list runtimes
+          xcodebuild -downloadPlatform iOS
+          xcodebuild -downloadPlatform watchOS
+          xcrun simctl list runtimes
+          df -h "$GITHUB_WORKSPACE"
+
+      - name: Verify build configuration template
+        run: |
+          set -euo pipefail
+          CONFIG="build-system/rufatgram-configuration.json"
+          if [ ! -f "$CONFIG" ]; then
+            echo "::error::$CONFIG is missing. It must be committed with placeholders; real values come from secrets."
+            exit 1
+          fi
+          python3 - "$CONFIG" <<'PY'
+          import json, sys
+          required = ["bundle_id", "api_id", "api_hash", "team_id", "app_center_id",
+                      "is_internal_build", "is_appstore_build", "appstore_id",
+                      "app_specific_url_scheme", "premium_iap_product_id",
+                      "enable_siri", "enable_icloud", "sg_config"]
+          with open(sys.argv[1]) as f:
+              cfg = json.load(f)
+          missing = [k for k in required if k not in cfg]
+          if missing:
+              print(f"::error::Configuration is missing keys: {', '.join(missing)}")
+              sys.exit(1)
+          if cfg["bundle_id"] == "ph.telegra.Telegraph":
+              print("::error::Refusing to build with the official Telegram.app bundle id.")
+              sys.exit(1)
+          if str(cfg["api_id"]) == "8":
+              print("::error::The template still carries the Telegram demo api_id.")
+              sys.exit(1)
+          print(f"Template bundle id: {cfg['bundle_id']}, team id: {cfg['team_id']}")
+          PY
+
+      - name: Select signing mode
+        id: signing
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.signed }}" = "true" ]; then
+            echo "mode=signed" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+            echo "::notice::Unsigned prototype build: the IPA installs only with an external signing tool."
+          fi
+
+      - name: Prepare build configuration
+        id: configuration
+        env:
+          RUFATGRAM_API_ID: ${{ secrets.RUFATGRAM_API_ID }}
+          RUFATGRAM_API_HASH: ${{ secrets.RUFATGRAM_API_HASH }}
+          RUFATGRAM_TEAM_ID: ${{ secrets.RUFATGRAM_TEAM_ID }}
+          RUFATGRAM_BUNDLE_ID: ${{ secrets.RUFATGRAM_BUNDLE_ID }}
+          RUFATGRAM_URL_SCHEME: ${{ secrets.RUFATGRAM_URL_SCHEME }}
+        run: |
+          set -euo pipefail
+          CONFIG="build-system/rufatgram-configuration.local.json"
+          python3 tools/ci/prepare-configuration.py build-system/rufatgram-configuration.json "$CONFIG"
+          test -f "$CONFIG"
+          echo "path=$CONFIG" >> "$GITHUB_OUTPUT"
+
+      - name: Import signing certificate and provisioning profiles
+        if: steps.signing.outputs.mode == 'signed'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          PROFILES_JSON_BASE64: ${{ secrets.PROFILES_JSON_BASE64 }}
+        run: bash tools/ci/import-signing-assets.sh
+
+      - name: Resolve codesigning information path
+        id: codesign
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.signing.outputs.mode }}" = "signed" ] && [ -d build-system/rufatgram-codesigning ]; then
+            if ls build-system/rufatgram-codesigning/profiles/*.mobileprovision >/dev/null 2>&1; then
+              echo "path=build-system/rufatgram-codesigning" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          if [ "${{ steps.signing.outputs.mode }}" = "signed" ]; then
+            echo "path=xcode-managed" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$RUNNER_TEMP/rufatgram-fake-signing" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate placeholder signing assets for the prototype build
+        if: steps.codesign.outputs.path != 'xcode-managed' && steps.signing.outputs.mode == 'unsigned'
+        run: |
+          set -euo pipefail
+          # The profiles committed in build-system/fake-codesigning are issued for
+          # the official Telegram bundle id. Rebuild them for the configured team and
+          # bundle id, otherwise Make.py rejects the signing inputs.
+          python3 tools/ci/generate-fake-codesigning.py \
+            --configuration "${{ steps.configuration.outputs.path }}" \
+            --certificates build-system/fake-codesigning/certs \
+            --output "$RUNNER_TEMP/rufatgram-fake-signing"
+          # Make.py does not import certificates on its own; codesign needs the
+          # placeholder identity in a keychain that is part of the search list.
+          python3 build-system/Make/ImportCertificates.py \
+            --path "$RUNNER_TEMP/rufatgram-fake-signing/certs"
+          # rules_apple looks identities up with `security find-identity -v`, which
+          # lists only trusted ones. The placeholder certificate is self-signed, so
+          # trust it for code signing on this ephemeral runner only.
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain \
+            "$RUNNER_TEMP/rufatgram-fake-signing/certs/Public.cer"
+          security find-identity -v -p codesigning
+          if ! security find-identity -v -p codesigning | grep -qE '^ *[1-9][0-9]* valid identit'; then
+            echo "::error::No valid code signing identity after importing placeholder certificates."
+            exit 1
+          fi
+
+      - name: Compute build number
+        id: buildnum
+        run: |
+          set -euo pipefail
+          OFFSET="$(cat build_number_offset)"
+          COUNT="$(git rev-list --count HEAD)"
+          echo "number=$((COUNT + OFFSET))" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Bazel repository cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.BAZEL_CACHE_DIR }}
+            ~/.cache/bazel
+          key: bazel-${{ runner.os }}-${{ hashFiles('versions.json', 'MODULE.bazel', 'MODULE.bazel.lock') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      - name: Build the app
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [ "${{ steps.codesign.outputs.path }}" = "xcode-managed" ]; then
+            EXTRA_ARGS+=(--xcodeManagedCodesigning)
+          else
+            EXTRA_ARGS+=(--codesigningInformationPath="${{ steps.codesign.outputs.path }}")
+          fi
+
+          mkdir -p "$BAZEL_CACHE_DIR" build/artifacts
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$HOME/bazel-user-root" \
+            --cacheDir="$BAZEL_CACHE_DIR" \
+            build \
+            --configurationPath="${{ steps.configuration.outputs.path }}" \
+            "${EXTRA_ARGS[@]}" \
+            --configuration=release_arm64 \
+            --buildNumber="${{ steps.buildnum.outputs.number }}" \
+            --enableParallelSwiftmoduleGeneration \
+            --outputBuildArtifactsPath="$PWD/build/artifacts"
+
+      - name: Verify produced IPA
+        if: always() && steps.build.outcome == 'success'
+        run: |
+          set -euo pipefail
+          IPA="build/artifacts/Swiftgram.ipa"
+          if [ ! -f "$IPA" ]; then
+            echo "::error::Build finished but $IPA was not produced."
+            find . -maxdepth 3 -name '*.ipa' -print || true
+            exit 1
+          fi
+          ls -lh "$IPA"
+          mkdir -p build/inspect
+          unzip -q "$IPA" -d build/inspect
+          APP="$(find build/inspect/Payload -maxdepth 1 -name '*.app' -print -quit)"
+          echo "App bundle: $APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist"
+          lipo -info "$APP/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Info.plist")"
+
+          BUNDLE_ID="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["bundle_id"])' "${{ steps.configuration.outputs.path }}")"
+          ACTUAL_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          if [ "$BUNDLE_ID" != "$ACTUAL_ID" ]; then
+            echo "::error::Bundle id mismatch: expected $BUNDLE_ID, got $ACTUAL_ID"
+            exit 1
+          fi
+
+          {
+            echo "### RufatGram build"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Bundle id | \`$ACTUAL_ID\` |"
+            echo "| Version | $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Info.plist") ($(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Info.plist")) |"
+            echo "| Signing | ${{ steps.signing.outputs.mode }} |"
+            echo "| Xcode | $(xcodebuild -version | head -n1) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify code signature (signed builds)
+        if: always() && steps.build.outcome == 'success' && steps.signing.outputs.mode == 'signed'
+        run: |
+          set -euo pipefail
+          APP="$(find build/inspect/Payload -maxdepth 1 -name '*.app' -print -quit)"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | sed -n 's/^Authority=/authority: /p'
+          echo "--- embedded profile ---"
+          if [ -f "$APP/embedded.mobileprovision" ]; then
+            security cms -D -i "$APP/embedded.mobileprovision" | plutil -extract Name raw -o - -
+            security cms -D -i "$APP/embedded.mobileprovision" | plutil -extract ExpirationDate raw -o - -
+            security cms -D -i "$APP/embedded.mobileprovision" | plutil -extract Entitlements.application-identifier raw -o - -
+          else
+            echo "::warning::embedded.mobileprovision is missing from the signed build."
+          fi
+
+      - name: Upload IPA
+        if: always() && steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: RufatGram-${{ github.run_number }}-${{ steps.signing.outputs.mode }}
+          path: |
+            build/artifacts/Swiftgram.ipa
+            build/artifacts/Swiftgram.DSYMs.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            **/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report failure details
+        if: failure()
+        run: |
+          echo "::error::Build failed. Inspect the 'Build the app' step above; Bazel writes the real error before this banner."
+          echo "Common causes: Xcode version mismatch (versions.json vs runner image), missing submodule, disk space, or a signing profile whose application-identifier does not start with <TEAM_ID>.<BUNDLE_ID>."

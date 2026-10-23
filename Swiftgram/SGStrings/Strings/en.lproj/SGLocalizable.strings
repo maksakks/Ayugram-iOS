@@ -262,3 +262,15 @@
 
 "AppBadge.Title" = "App Badge";
 "AppBadge.Notice" = "Customize App Badge shown on screenshots";
+
+"PrivacyCenter.Title" = "Privacy Center";
+"PrivacyCenter.Intro" = "Options are grouped by how reliably the app can honour them. Read receipts, online status and story views are recorded by Telegram servers; the app cannot hide them from the server.";
+"PrivacyCenter.Supported.Header" = "SUPPORTED";
+"PrivacyCenter.Supported.Notice" = "These options only change what this app shows or asks on this device.";
+"PrivacyCenter.Partial.Header" = "PARTIALLY SUPPORTED";
+"PrivacyCenter.Partial.StealthNotice" = "The app stops sending the story \"seen\" mark. This is not a guarantee of anonymity: the server may still register a view when media is downloaded or on other devices of your account.";
+"PrivacyCenter.Unsupported.Header" = "NOT SUPPORTED";
+"PrivacyCenter.Unsupported.List" = "• Hiding read receipts from the server\n• Being invisible while online\n• Guaranteed anonymous story viewing without Premium\n• Restoring messages the app never received";
+"PrivacyCenter.Official.Header" = "TELEGRAM PRIVACY";
+"PrivacyCenter.Official.Notice" = "Last seen, online status, read time and phone number visibility are controlled by Telegram privacy settings on the server.";
+"Settings.PrivacyCenter" = "Privacy Center";
